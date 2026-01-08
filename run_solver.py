@@ -1,10 +1,3 @@
-"""
-反向求解器测试文件（优化版）
-- 全局加载数据（只加载一次）
-- 每个测试使用不同的随机种子
-- 完整的α敏感性分析（0.05-0.95）
-"""
-
 import sys
 import os
 import pickle
@@ -12,18 +5,14 @@ import gzip
 from datetime import datetime
 import numpy as np
 import time as time_module
-import matplotlib.pyplot as plt
-from typing import List, Dict, Tuple, Optional
-from reverse_solver_pseudocode import ReverseLabelSettingSolver
-import config as config
-from visualization_generator import generate_html_with_svg
-import time
-from result_manager import save_results
-# ═══════════════════════════════════════════════════════════════════
+from collections import defaultdict
+from typing import Dict, Tuple
+from pathlib import Path  # ← 添加这行
+# ════════════════════════════════════════════════════════════════
 # 全局变量：数据（只加载一次）
-# ═══════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
 
-# 全局数据变量
+# 原有全局数据变量
 G_GLOBAL = None
 SPARSE_DATA_GLOBAL = None
 NODE_TO_INDEX_GLOBAL = None
@@ -31,50 +20,161 @@ SCENARIO_DATES_GLOBAL = None
 SCENARIO_PROBS_GLOBAL = None
 TIME_INTERVALS_PER_DAY_GLOBAL = None
 
+# ✨ 新增：预计算的数据结构
+ADJ_LIST_FORWARD_GLOBAL = None  # 正向邻接表
+ADJ_LIST_BACKWARD_GLOBAL = None  # 反向邻接表
+LINK_DISTRIBUTIONS_GLOBAL = None  # 链路分布
+LINK_DISTRIBUTIONS_BACKWARD_GLOBAL = None
+
 DATA_LOADED = False
 
-
-def load_data_once(data_path=None):
-    """全局加载数据（只加载一次）"""
-    global G_GLOBAL, SPARSE_DATA_GLOBAL, NODE_TO_INDEX_GLOBAL
+def load_data_once(data_path=None, cache_file='precomputed_data.pkl.gz', force_rebuild=False):
+    """
+    全局加载数据（只加载一次）
+    ✨ 新增：同时预计算邻接表和链路分布，支持缓存
+    
+    Args:
+        data_path: 数据文件路径
+        cache_file: 缓存文件路径
+        force_rebuild: 是否强制重建缓存（忽略已有缓存）
+    """
+    global G_GLOBAL, SPARSE_DATA_GLOBAL, NODE_TO_INDEX_GLOBAL, INDEX_TO_NODE_GLOBAL
     global SCENARIO_DATES_GLOBAL, SCENARIO_PROBS_GLOBAL, TIME_INTERVALS_PER_DAY_GLOBAL
+    global ADJ_LIST_FORWARD_GLOBAL, ADJ_LIST_BACKWARD_GLOBAL, LINK_DISTRIBUTIONS_GLOBAL
+    global LINK_DISTRIBUTIONS_BACKWARD_GLOBAL  # ← 新增：用于反向求解
     global DATA_LOADED
     
-    if DATA_LOADED:
+    if DATA_LOADED and not force_rebuild:
+        print("数据已加载，跳过重复加载")
         return (G_GLOBAL, SPARSE_DATA_GLOBAL, NODE_TO_INDEX_GLOBAL,
                 SCENARIO_DATES_GLOBAL, SCENARIO_PROBS_GLOBAL, TIME_INTERVALS_PER_DAY_GLOBAL)
     
-    if data_path is None:
-        data_path = config.DATA_PATH
+    # 导入config
+    try:
+        import config as config
+        if data_path is None: 
+            data_path = config.DATA_PATH
+    except: 
+        if data_path is None:
+            data_path = 'data/test_data.pkl.gz'
     
     print(f"\n{'='*70}")
-    print(f"加载测试数据（仅加载一次）")
+    print(f"加载和预处理数据（优化版 - 支持缓存）")
     print(f"{'='*70}")
     print(f"  数据文件: {data_path}")
+    print(f"  缓存文件: {cache_file}")
     
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"数据文件不存在: {data_path}")
     
     start_time = time_module.time()
     
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 步骤1：加载基础数据
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    print(f"\n[1/4] 加载基础数据...")
     with gzip.open(data_path, 'rb') as f:
         data = pickle.load(f)
     
     G_GLOBAL = data['G']
     SPARSE_DATA_GLOBAL = data['sparse_data']
     NODE_TO_INDEX_GLOBAL = data['node_to_index']
+    INDEX_TO_NODE_GLOBAL = {v: k for k, v in NODE_TO_INDEX_GLOBAL.items()}
     SCENARIO_DATES_GLOBAL = [datetime.strptime(d, '%Y-%m-%d').date() 
-                             for d in data['scenario_dates']]
+                              for d in data['scenario_dates']]
     SCENARIO_PROBS_GLOBAL = data['scenario_probs']
     TIME_INTERVALS_PER_DAY_GLOBAL = data['time_intervals_per_day']
     
+    print(f"  ✓ 基础数据加载完成")
+    print(f"    节点数: {len(G_GLOBAL.nodes()):,}")
+    print(f"    边数: {len(G_GLOBAL.edges()):,}")
+    print(f"    场景数: {len(SCENARIO_DATES_GLOBAL)}")
+    print(f"    时间片数/天: {TIME_INTERVALS_PER_DAY_GLOBAL}")
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 步骤2：尝试从缓存加载预计算数据
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    cache_loaded = False
+    
+    if not force_rebuild and Path(cache_file).exists():
+        print(f"\n[2/4] 尝试从缓存加载预计算数据...")
+        cache_result = load_precomputed_data(cache_file)
+        
+        if cache_result is not None:
+            ADJ_LIST_FORWARD_GLOBAL, ADJ_LIST_BACKWARD_GLOBAL, LINK_DISTRIBUTIONS_GLOBAL, LINK_DISTRIBUTIONS_BACKWARD_GLOBAL = cache_result
+            cache_loaded = True
+            print(f"  🚀 从缓存加载成功！")
+        else:
+            print(f"  ⚠️ 缓存加载失败，将重新计算")
+    else:
+        if force_rebuild:
+            print(f"\n[2/4] 强制重建预计算数据...")
+        else:
+            print(f"\n[2/4] 缓存文件不存在，需要计算预计算数据...")
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 步骤3：如果缓存未加载，重新计算并保存
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if not cache_loaded:
+        print(f"\n[3/4] 计算预计算数据...")
+        
+        # 3.1 构建邻接表
+        print(f"  [3.1] 构建邻接表...")
+        adj_start = time_module.time()
+        
+        ADJ_LIST_FORWARD_GLOBAL, ADJ_LIST_BACKWARD_GLOBAL = _build_adjacency_lists(
+            SPARSE_DATA_GLOBAL,
+            NODE_TO_INDEX_GLOBAL,
+            len(SCENARIO_DATES_GLOBAL)
+        )
+        
+        adj_time = time_module.time() - adj_start
+        print(f"    ✓ 邻接表构建完成 (用时 {adj_time:.2f}秒)")
+        print(f"      正向邻接表: {len(ADJ_LIST_FORWARD_GLOBAL)} 个节点")
+        print(f"      反向邻接表:  {len(ADJ_LIST_BACKWARD_GLOBAL)} 个节点")
+        
+        # 3.2 预计算链路分布（同时生成正向和反向）
+        print(f"  [3.2] 预计算链路分布...")
+        dist_start = time_module.time()
+        
+        # 修改：接收两个返回值
+        LINK_DISTRIBUTIONS_GLOBAL, LINK_DISTRIBUTIONS_BACKWARD_GLOBAL = _precompute_link_distributions(
+            SPARSE_DATA_GLOBAL,
+            NODE_TO_INDEX_GLOBAL,
+            len(SCENARIO_DATES_GLOBAL)
+        )
+        
+        dist_time = time_module.time() - dist_start
+        print(f"    ✓ 链路分布计算完成 (用时 {dist_time:.2f}秒)")
+        
+        # 3.3 保存到缓存
+        print(f"\n  [3.3] 保存预计算数据到缓存...")
+        save_precomputed_data(
+            ADJ_LIST_FORWARD_GLOBAL,
+            ADJ_LIST_BACKWARD_GLOBAL,
+            LINK_DISTRIBUTIONS_GLOBAL,
+            LINK_DISTRIBUTIONS_BACKWARD_GLOBAL,  # ← 新增参数
+            filename=cache_file
+        )
+    else:
+        # 如果从缓存加载，跳过步骤3
+        print(f"\n[3/4] ✓ 跳过计算（已从缓存加载）")
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 步骤4：完成
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     load_time = time_module.time() - start_time
     
-    print(f"  ✓ 加载成功 (用时 {load_time:.2f}秒)")
-    print(f"  节点数: {len(G_GLOBAL.nodes()):,}")
-    print(f"  边数: {len(G_GLOBAL.edges()):,}")
-    print(f"  场景数: {len(SCENARIO_DATES_GLOBAL)}")
-    print(f"  时间片数/天: {TIME_INTERVALS_PER_DAY_GLOBAL:,}")
+    print(f"\n[4/4] ✓ 数据加载和预处理完成！")
+    print(f"  总耗时: {load_time:.2f}秒")
+    if cache_loaded:
+        print(f"    基础数据加载: {load_time:.2f}秒")
+        print(f"    预计算数据:  从缓存加载 🚀")
+    else:
+        print(f"    基础数据加载: 约 {(load_time - adj_time - dist_time):.2f}秒")
+        print(f"    邻接表构建: {adj_time:.2f}秒")
+        print(f"    链路分布计算: {dist_time:.2f}秒")
+        print(f"    缓存保存: 已完成 💾")
     print(f"{'='*70}\n")
     
     DATA_LOADED = True
@@ -83,22 +183,444 @@ def load_data_once(data_path=None):
             SCENARIO_DATES_GLOBAL, SCENARIO_PROBS_GLOBAL, TIME_INTERVALS_PER_DAY_GLOBAL)
 
 
+def save_precomputed_data(adj_list_forward, adj_list_backward, 
+                          link_distributions_forward, link_distributions_backward,
+                          filename='precomputed_data.pkl.gz'):
+    """保存预计算数据（压缩，包含正向和反向链路分布）"""
+    print(f"\n{'='*70}")
+    print(f"保存预计算数据")
+    print(f"{'='*70}")
+    
+    data = {
+        'adj_list_forward': dict(adj_list_forward),
+        'adj_list_backward':  dict(adj_list_backward),
+        'link_distributions_forward': link_distributions_forward,  # ← 修改
+        'link_distributions_backward':  link_distributions_backward,  # ← 新增
+        'metadata': {
+            'timestamp': datetime.now().isoformat(),
+            'forward_nodes': len(adj_list_forward),
+            'reverse_nodes': len(adj_list_backward),
+            'forward_edges': sum(len(v) for v in adj_list_forward.values()),
+            'reverse_edges': sum(len(v) for v in adj_list_backward.values()),
+            'distributions_forward': len(link_distributions_forward),  # ← 修改
+            'distributions_backward':  len(link_distributions_backward)  # ← 新增
+        }
+    }
+    
+    start_time = time_module.time()
+    
+    # 保存为压缩文件
+    with gzip.open(filename, 'wb', compresslevel=6) as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    file_size = os.path.getsize(filename)
+    elapsed = time_module.time() - start_time
+    
+    print(f"  ✓ 已保存:  {filename}")
+    print(f"  文件大小: {file_size / 1024 / 1024:.2f} MB")
+    print(f"  耗时: {elapsed:.2f}秒")
+    print(f"{'='*70}\n")
+
+def load_precomputed_data(filename='precomputed_data.pkl.gz'):
+    """加载预计算数据（压缩，包含正向和反向链路分布）"""
+    if not os.path.exists(filename):
+        return None
+    
+    print(f"\n{'='*70}")
+    print(f"加载预计算数据")
+    print(f"{'='*70}")
+    
+    start_time = time_module.time()
+    
+    try:
+        with gzip.open(filename, 'rb') as f:
+            data = pickle.load(f)
+        
+        elapsed = time_module.time() - start_time
+        
+        metadata = data.get('metadata', {})
+        
+        print(f"  ✓ 已加载: {filename}")
+        print(f"  数据时间:  {metadata.get('timestamp', 'unknown')}")
+        print(f"  正向节点:  {metadata.get('forward_nodes', 0):,}")
+        print(f"  反向节点: {metadata.get('reverse_nodes', 0):,}")
+        print(f"  正向边数: {metadata.get('forward_edges', 0):,}")
+        print(f"  反向边数: {metadata.get('reverse_edges', 0):,}")
+        print(f"  正向链路分布: {metadata.get('distributions_forward', 0):,}")
+        print(f"  反向链路分布: {metadata.get('distributions_backward', 0):,}")
+        print(f"  加载耗时: {elapsed:.2f}秒")
+        print(f"{'='*70}\n")
+        
+        # 转换回 defaultdict
+        from collections import defaultdict
+        adj_forward = defaultdict(list, data['adj_list_forward'])
+        adj_backward = defaultdict(list, data['adj_list_backward'])
+        
+        # 兼容旧版本缓存（只有一个link_distributions）
+        if 'link_distributions_forward' in data:
+            link_dists_forward = data['link_distributions_forward']
+            link_dists_backward = data.get('link_distributions_backward', link_dists_forward)
+        else:
+            # 旧版本缓存
+            print(f"  ⚠️ 检测到旧版本缓存，正向和反向使用相同分布")
+            link_dists_forward = data.get('link_distributions', {})
+            link_dists_backward = link_dists_forward
+        
+        return adj_forward, adj_backward, link_dists_forward, link_dists_backward
+    
+    except Exception as e: 
+        print(f"  ✗ 加载失败:  {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"{'='*70}\n")
+        return None
+
+
+def get_precomputed_data():
+    """
+    ✨ 获取预计算的数据结构（从全局变量）
+    
+    Returns:
+        tuple: (adj_list_forward, adj_list_backward, link_distributions_forward, link_distributions_backward)
+    """
+    global LINK_DISTRIBUTIONS_BACKWARD_GLOBAL  # 确保声明了这个全局变量
+    
+    if not DATA_LOADED:
+        raise RuntimeError("数据未加载，请先调用 load_data_once()")
+    
+    # 兼容性：如果反向分布未定义，使用正向分布
+    if LINK_DISTRIBUTIONS_BACKWARD_GLOBAL is None:
+        print("  ⚠️ 反向链路分布未定义，使用正向分布")
+        LINK_DISTRIBUTIONS_BACKWARD_GLOBAL = LINK_DISTRIBUTIONS_GLOBAL
+    
+    return (ADJ_LIST_FORWARD_GLOBAL, ADJ_LIST_BACKWARD_GLOBAL, 
+            LINK_DISTRIBUTIONS_GLOBAL, LINK_DISTRIBUTIONS_BACKWARD_GLOBAL)
+
+
+# def load_data_once(data_path=None):
+#     """
+#     全局加载数据（只加载一次）
+#     ✨ 新增：同时预计算邻接表和链路分布
+#     """
+#     global G_GLOBAL, SPARSE_DATA_GLOBAL, NODE_TO_INDEX_GLOBAL
+#     global SCENARIO_DATES_GLOBAL, SCENARIO_PROBS_GLOBAL, TIME_INTERVALS_PER_DAY_GLOBAL
+#     global ADJ_LIST_FORWARD_GLOBAL, ADJ_LIST_BACKWARD_GLOBAL, LINK_DISTRIBUTIONS_GLOBAL
+#     global DATA_LOADED
+    
+#     if DATA_LOADED:
+#         print("数据已加载，跳过重复加载")
+#         return (G_GLOBAL, SPARSE_DATA_GLOBAL, NODE_TO_INDEX_GLOBAL,
+#                 SCENARIO_DATES_GLOBAL, SCENARIO_PROBS_GLOBAL, TIME_INTERVALS_PER_DAY_GLOBAL)
+    
+#     # 导入config
+#     try:
+#         import config as config
+#         if data_path is None:
+#             data_path = config.DATA_PATH
+#     except: 
+#         if data_path is None:
+#             data_path = 'data/test_data.pkl.gz'
+    
+#     print(f"\n{'='*70}")
+#     print(f"加载和预处理数据（优化版 - 只执行一次）")
+#     print(f"{'='*70}")
+#     print(f"  数据文件: {data_path}")
+    
+#     if not os.path.exists(data_path):
+#         raise FileNotFoundError(f"数据文件不存在: {data_path}")
+    
+#     start_time = time_module.time()
+    
+#     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#     # 步骤1：加载基础数据
+#     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#     print(f"\n[1/4] 加载基础数据...")
+#     with gzip.open(data_path, 'rb') as f:
+#         data = pickle.load(f)
+    
+#     G_GLOBAL = data['G']
+#     SPARSE_DATA_GLOBAL = data['sparse_data']
+#     NODE_TO_INDEX_GLOBAL = data['node_to_index']
+#     SCENARIO_DATES_GLOBAL = [datetime.strptime(d, '%Y-%m-%d').date() 
+#                               for d in data['scenario_dates']]
+#     SCENARIO_PROBS_GLOBAL = data['scenario_probs']
+#     TIME_INTERVALS_PER_DAY_GLOBAL = data['time_intervals_per_day']
+    
+#     print(f"  ✓ 基础数据加载完成")
+#     print(f"    节点数: {len(G_GLOBAL.nodes()):,}")
+#     print(f"    边数: {len(G_GLOBAL.edges()):,}")
+#     print(f"    场景数: {len(SCENARIO_DATES_GLOBAL)}")
+#     print(f"    时间片数/天: {TIME_INTERVALS_PER_DAY_GLOBAL}")
+    
+#     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#     # 步骤2：构建邻接表
+#     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#     print(f"\n[2/4] 构建邻接表...")
+#     adj_start = time_module.time()
+    
+#     ADJ_LIST_FORWARD_GLOBAL, ADJ_LIST_BACKWARD_GLOBAL = _build_adjacency_lists(
+#         SPARSE_DATA_GLOBAL,
+#         NODE_TO_INDEX_GLOBAL,
+#         len(SCENARIO_DATES_GLOBAL)
+#     )
+    
+#     adj_time = time_module.time() - adj_start
+#     print(f"  ✓ 邻接表构建完成 (用时 {adj_time:.2f}秒)")
+#     print(f"    正向邻接表: {len(ADJ_LIST_FORWARD_GLOBAL)} 个节点")
+#     print(f"    反向邻接表: {len(ADJ_LIST_BACKWARD_GLOBAL)} 个节点")
+    
+#     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#     # 步骤3：预计算链路分布
+#     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#     print(f"\n[3/4] 预计算链路分布...")
+#     dist_start = time_module.time()
+    
+#     LINK_DISTRIBUTIONS_GLOBAL = _precompute_link_distributions(
+#         SPARSE_DATA_GLOBAL,
+#         NODE_TO_INDEX_GLOBAL,
+#         len(SCENARIO_DATES_GLOBAL)
+#     )
+    
+#     dist_time = time_module.time() - dist_start
+#     print(f"  ✓ 链路分布计算完成 (用时 {dist_time:.2f}秒)")
+#     print(f"    链路分布数: {len(LINK_DISTRIBUTIONS_GLOBAL):,}")
+    
+#     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#     # 步骤4：完成
+#     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#     load_time = time_module.time() - start_time
+    
+#     print(f"\n[4/4] ✓ 数据加载和预处理完成！")
+#     print(f"  总耗时: {load_time:.2f}秒")
+#     print(f"    基础数据加载: {load_time - adj_time - dist_time:.2f}秒")
+#     print(f"    邻接表构建: {adj_time:.2f}秒")
+#     print(f"    链路分布计算: {dist_time:.2f}秒")
+#     print(f"{'='*70}\n")
+    
+#     DATA_LOADED = True
+    
+#     return (G_GLOBAL, SPARSE_DATA_GLOBAL, NODE_TO_INDEX_GLOBAL,
+#             SCENARIO_DATES_GLOBAL, SCENARIO_PROBS_GLOBAL, TIME_INTERVALS_PER_DAY_GLOBAL)
+
+
+def _build_adjacency_lists(sparse_data:  Dict, node_to_index: Dict, n_scenarios: int) -> Tuple[Dict, Dict]:
+    """
+    构建正向和反向邻接表
+    
+    Args:
+        sparse_data: 稀疏旅行时间数据
+        node_to_index: 节点到索引的映射
+        n_scenarios: 场景数量
+    
+    Returns:
+        adj_list_forward: 正向邻接表 {from_node: [to_node1, to_node2, ...]}
+        adj_list_backward: 反向邻接表 {to_node: [from_node1, from_node2, ...]}
+    """
+    index_to_node = {v:  k for k, v in node_to_index.items()}
+    
+    # 提取唯一边（去重）
+    edges_set = set()
+    for (scenario_idx, time_idx, from_idx, to_idx) in sparse_data.keys():
+        if scenario_idx < n_scenarios:
+            from_node = index_to_node[from_idx]
+            to_node = index_to_node[to_idx]
+            edges_set.add((from_node, to_node))
+    
+    # 构建邻接表
+    adj_list_forward = defaultdict(list)
+    adj_list_backward = defaultdict(list)
+    
+    for from_node, to_node in edges_set:
+        adj_list_forward[from_node].append(to_node)
+        adj_list_backward[to_node].append(from_node)
+    
+    # 转换为普通字典
+    return dict(adj_list_forward), dict(adj_list_backward)
+
+def _precompute_link_distributions(sparse_data: Dict, node_to_index: Dict, n_scenarios: int) -> tuple: 
+    """
+    预计算所有链路的旅行时间分布（同时生成正向和反向版本）
+    
+    Args: 
+        sparse_data: 稀疏旅行时间数据
+        node_to_index: 节点到索引的映射
+        n_scenarios: 场景数量
+    
+    Returns: 
+        tuple: (link_distributions_forward, link_distributions_backward)
+            - link_distributions_forward: 正向求解用，{(from_node, to_node, time_slot): LinkTimeDistribution}
+            - link_distributions_backward: 反向求解用，{(from_node, to_node, time_slot): LinkTimeDistribution}
+    """
+    print(f"    同时计算正向和反向链路分布...")
+    start_time = time_module.time()
+    
+    # 延迟导入，避免循环依赖
+    try:
+        from forward_solver import LinkTimeDistribution as ForwardLinkDist
+        forward_available = True
+    except ImportError: 
+        print(f"      ⚠️ 警告: 无法导入 forward_solver.LinkTimeDistribution")
+        forward_available = False
+    
+    try:
+        from reverse_solver_pseudocode import LinkTimeDistribution as ReverseLinkDist
+        reverse_available = True
+    except ImportError:
+        print(f"      ⚠️ 警告: 无法导入 reverse_solver_pseudocode.LinkTimeDistribution")
+        reverse_available = False
+    
+    if not forward_available and not reverse_available:
+        raise ImportError("无法导入任何 LinkTimeDistribution 类")
+    
+    index_to_node = {v:  k for k, v in node_to_index.items()}
+    
+    # 收集每条链路在每个时间片的旅行时间
+    link_time_data = defaultdict(list)
+    
+    for (scenario_idx, time_idx, from_idx, to_idx), travel_time_minutes in sparse_data.items():
+        if scenario_idx >= n_scenarios: 
+            continue
+        
+        from_node = index_to_node[from_idx]
+        to_node = index_to_node[to_idx]
+        travel_time_01min = int(travel_time_minutes * 10)  # 转换为0.1分钟单位
+        
+        link_time_data[(from_node, to_node, time_idx)].append(travel_time_01min)
+    
+    # 计算分布
+    link_distributions_forward = {}
+    link_distributions_backward = {}
+    distribution_count = 0
+    skipped_count = 0
+    
+    for (u, v, t), times in link_time_data.items():
+        # 统计频率
+        time_counts = defaultdict(int)
+        for time_val in times:
+            time_counts[time_val] += 1
+        
+        # 计算概率
+        total = len(times)
+        time_prob = {time_val:  count/total for time_val, count in time_counts.items()}
+        
+        # 创建正向分布对象
+        if forward_available:
+            try: 
+                link_distributions_forward[(u, v, t)] = ForwardLinkDist(time_prob, time_slot=t)
+                distribution_count += 1
+            except (ValueError, Exception) as e:
+                skipped_count += 1
+        
+        # 创建反向分布对象
+        if reverse_available:
+            try: 
+                link_distributions_backward[(u, v, t)] = ReverseLinkDist(time_prob, time_slot=t)
+            except (ValueError, Exception) as e:
+                pass
+    
+    elapsed = time_module.time() - start_time
+    
+    print(f"      ✓ 完成 (用时 {elapsed:.2f}s)")
+    print(f"        正向分布:  {len(link_distributions_forward):,} 个")
+    print(f"        反向分布: {len(link_distributions_backward):,} 个")
+    if skipped_count > 0:
+        print(f"        跳过无效:  {skipped_count} 个")
+    
+    return link_distributions_forward, link_distributions_backward
+
+
+# def _precompute_link_distributions(sparse_data: Dict, node_to_index: Dict, n_scenarios: int) -> Dict:
+#     """
+#     预计算所有链路的旅行时间分布
+    
+#     Args:
+#         sparse_data: 稀疏旅行时间数据
+#         node_to_index: 节点到索引的映射
+#         n_scenarios: 场景数量
+    
+#     Returns: 
+#         link_distributions: {(from_node, to_node, time_slot): LinkTimeDistribution}
+#     """
+#     from forward_solver import LinkTimeDistribution
+
+#     from reverse_solver_pseudocode import LinkTimeDistribution as LinkTimeDistributionbw
+    
+#     index_to_node = {v:  k for k, v in node_to_index.items()}
+    
+#     # 收集每条链路在每个时间片的旅行时间
+#     link_time_data = defaultdict(list)
+    
+#     for (scenario_idx, time_idx, from_idx, to_idx), travel_time_minutes in sparse_data.items():
+#         if scenario_idx >= n_scenarios:
+#             continue
+        
+#         from_node = index_to_node[from_idx]
+#         to_node = index_to_node[to_idx]
+#         travel_time_01min = int(travel_time_minutes * 10)  # 转换为0.1分钟单位
+        
+#         link_time_data[(from_node, to_node, time_idx)].append(travel_time_01min)
+    
+#     # 计算分布
+#     link_distributions = {}
+#     distribution_count = 0
+#     skipped_count = 0
+    
+#     for (u, v, t), times in link_time_data.items():
+#         # 统计频率
+#         time_counts = defaultdict(int)
+#         for time_val in times:
+#             time_counts[time_val] += 1
+        
+#         # 计算概率
+#         total = len(times)
+#         time_prob = {time_val: count/total for time_val, count in time_counts.items()}
+        
+#         # 创建分布对象
+#         try:
+#             link_distributions[(u, v, t)] = LinkTimeDistribution(time_prob, time_slot=t)
+#             distribution_count += 1
+#         except ValueError:
+#             # 分布无效（如全零），跳过
+#             skipped_count += 1
+#             continue
+    
+#     if skipped_count > 0:
+#         print(f"    (跳过 {skipped_count} 个无效分布)")
+    
+#     return link_distributions
+
+
 def get_data():
-    """获取全局数据"""
+    """获取全局基础数据"""
     if not DATA_LOADED:
         return load_data_once()
     return (G_GLOBAL, SPARSE_DATA_GLOBAL, NODE_TO_INDEX_GLOBAL,
             SCENARIO_DATES_GLOBAL, SCENARIO_PROBS_GLOBAL, TIME_INTERVALS_PER_DAY_GLOBAL)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 辅助函数
-# ═══════════════════════════════════════════════════════════════════
+# def get_precomputed_data():
+#     """
+#     ✨ 新增：获取预计算的数据结构
+    
+#     Returns:
+#         adj_list_forward: 正向邻接表
+#         adj_list_backward: 反向邻接表
+#         link_distributions: 链路分布
+#     """
+#     if not DATA_LOADED:
+#         raise RuntimeError("数据未加载，请先调用 load_data_once()")
+    
+#     return ADJ_LIST_FORWARD_GLOBAL, ADJ_LIST_BACKWARD_GLOBAL, LINK_DISTRIBUTIONS_GLOBAL
+
+
+# ════════════════════════════════════════════════════════════════
+# 保留原有的辅助函数
+# ════════════════════════════════════════════════════════════════
 
 def select_od_pair(node_to_index):
     """选择OD对（使用指定种子）"""
     nodes = list(node_to_index.keys())
-    np.random.seed(int(time.time()))
+    np.random.seed(int(time_module.time()))
     origin = np.random.choice(nodes)
     destination = np.random.choice([n for n in nodes if n != origin])
     return origin, destination
@@ -112,235 +634,19 @@ def time_to_string(time_01min):
     return f"{hours:02d}:{minutes:02d}"
 
 
-
-# ═══════════════════════════════════════════════════════════════════
-# 测试1: 绘图
-# ═══════════════════════════════════════════════════════════════════
-
-def plot_all_paths_distributions(result, alpha, target_arrival_time, 
-                                 output_file='all_paths_distributions.png'):
-    """
-    绘制所有候选路径的出发时间分布对比图
-    
-    Args:
-        result: solve()的返回结果（包含all_paths）
-        alpha: 可靠性参数
-        target_arrival_time: 目标到达时间
-        output_file: 输出文件路径
-    """
-    
-    if 'all_paths' not in result or not result['all_paths']:
-        print("没有保存的路径分布数据")
-        return
-    
-    all_paths = result['all_paths']
-    
-    print(f"\n{'='*70}")
-    print(f"绘制所有候选路径的出发时间分布")
-    print(f"{'='*70}")
-    print(f"  候选路径数量: {len(all_paths)}")
-    print(f"  可靠性α: {alpha}")
-    print(f"  目标到达时间: {time_to_string(target_arrival_time)}")
-    
-    # ═══════════════════════════════════════════════════════════════════
-    # 创建图表
-    # ═══════════════════════════════════════════════════════════════════
-    
-    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
-    
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 子图1: 所有分布的CDF对比
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    ax1 = axes[0, 0]
-    
-    best_path_idx = None
-    colors = plt.cm.viridis(np.linspace(0, 1, len(all_paths)))
-    
-    for i, path_info in enumerate(all_paths):
-        dist = path_info['distribution']
-        values = sorted(dist.values)
-        cdf = np.arange(1, len(values) + 1) / len(values)
-        
-        if path_info['is_best']:
-            # 最优路径用红色粗线
-            ax1.plot([v/10 for v in values], cdf, 
-                    color='red', linewidth=3, alpha=0.9,
-                    label=f'最优路径 (路径{i+1})', zorder=10)
-            best_path_idx = i
-        else:
-            # 其他路径用半透明细线
-            ax1.plot([v/10 for v in values], cdf, 
-                    color=colors[i], linewidth=1, alpha=0.3)
-    
-    # 标记关键分位数
-    ax1.axhline(1 - alpha, color='orange', linestyle='--', linewidth=2,
-                label=f'α={alpha} 分位数线')
-    ax1.axvline(target_arrival_time/10, color='green', linestyle='--', linewidth=2,
-                label='目标到达时间')
-    
-    ax1.set_xlabel('出发时间 (分钟)', fontsize=12, fontweight='bold')
-    ax1.set_ylabel('累积概率 (CDF)', fontsize=12, fontweight='bold')
-    ax1.set_title(f'所有候选路径的CDF对比 (共{len(all_paths)}条)', 
-                 fontsize=14, fontweight='bold')
-    ax1.legend(loc='best', fontsize=10)
-    ax1.grid(alpha=0.3)
-    
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 子图2: 关键分位数对比（箱线图风格）
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    ax2 = axes[0, 1]
-    
-    quantiles_to_show = [0.05, 0.25, 0.5, 0.75, 0.95, 1-alpha]
-    quantile_labels = ['Q5', 'Q25', 'Q50', 'Q75', 'Q95', f'Q{int((1-alpha)*100)}']
-    
-    x_positions = np.arange(len(all_paths))
-    width = 0.12
-    
-    for q_idx, (q, label) in enumerate(zip(quantiles_to_show, quantile_labels)):
-        q_values = []
-        for path_info in all_paths:
-            q_val = path_info['distribution'].get_quantile(q) / 10
-            q_values.append(q_val)
-        
-        offset = (q_idx - len(quantiles_to_show)/2) * width
-        ax2.bar(x_positions + offset, q_values, width, 
-               label=label, alpha=0.7)
-    
-    # 高亮最优路径
-    if best_path_idx is not None:
-        ax2.axvline(best_path_idx, color='red', linestyle='--', 
-                   linewidth=2, alpha=0.5, label='最优路径')
-    
-    ax2.set_xlabel('路径编号', fontsize=12, fontweight='bold')
-    ax2.set_ylabel('出发时间 (分钟)', fontsize=12, fontweight='bold')
-    ax2.set_title('各路径的关键分位数对比', fontsize=14, fontweight='bold')
-    ax2.set_xticks(x_positions)
-    ax2.set_xticklabels([f'P{i+1}' for i in range(len(all_paths))], rotation=45)
-    ax2.legend(loc='best', fontsize=9, ncol=2)
-    ax2.grid(axis='y', alpha=0.3)
-    
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 子图3: 最优路径 vs 次优路径的详细对比
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    ax3 = axes[1, 0]
-    
-    if best_path_idx is not None and len(all_paths) > 1:
-        # 找到次优路径（latest_departure第二大的）
-        sorted_paths = sorted(enumerate(all_paths), 
-                            key=lambda x: x[1]['latest_departure'], 
-                            reverse=True)
-        
-        best_idx, best_info = sorted_paths[0]
-        second_idx, second_info = sorted_paths[1] if len(sorted_paths) > 1 else (None, None)
-        
-        # 绘制最优路径分布
-        best_values = sorted(best_info['distribution'].values)
-        best_cdf = np.arange(1, len(best_values) + 1) / len(best_values)
-        ax3.plot([v/10 for v in best_values], best_cdf,
-                'r-', linewidth=3, label=f'最优路径 (P{best_idx+1})')
-        
-        # 绘制次优路径分布
-        if second_info:
-            second_values = sorted(second_info['distribution'].values)
-            second_cdf = np.arange(1, len(second_values) + 1) / len(second_values)
-            ax3.plot([v/10 for v in second_values], second_cdf,
-                    'b--', linewidth=2, label=f'次优路径 (P{second_idx+1})')
-        
-        # 标记α分位数
-        best_q = best_info['distribution'].get_quantile(1-alpha) / 10
-        ax3.axvline(best_q, color='red', linestyle=':', linewidth=2,
-                   label=f'最优路径 α-分位数')
-        
-        if second_info:
-            second_q = second_info['distribution'].get_quantile(1-alpha) / 10
-            ax3.axvline(second_q, color='blue', linestyle=':', linewidth=2,
-                       label=f'次优路径 α-分位数')
-        
-        ax3.axhline(1-alpha, color='orange', linestyle='--', alpha=0.5)
-        
-        ax3.set_xlabel('出发时间 (分钟)', fontsize=12, fontweight='bold')
-        ax3.set_ylabel('累积概率', fontsize=12, fontweight='bold')
-        ax3.set_title('最优 vs 次优路径详细对比', fontsize=14, fontweight='bold')
-        ax3.legend(loc='best', fontsize=10)
-        ax3.grid(alpha=0.3)
-        
-        # 添加文本说明
-        info_text = f"最优路径:\n"
-        info_text += f"  最晚出发: {time_to_string(best_info['latest_departure'])}\n"
-        info_text += f"  期望出发: {time_to_string(best_info['expected_departure'])}\n"
-        info_text += f"  路径长度: {len(best_info['path'])}\n"
-        if second_info:
-            info_text += f"\n次优路径:\n"
-            info_text += f"  最晚出发: {time_to_string(second_info['latest_departure'])}\n"
-            info_text += f"  期望出发: {time_to_string(second_info['expected_departure'])}\n"
-            info_text += f"  路径长度: {len(second_info['path'])}\n"
-        
-        ax3.text(0.02, 0.98, info_text, transform=ax3.transAxes,
-                fontsize=9, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 子图4: 统计信息汇总
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    ax4 = axes[1, 1]
-    ax4.axis('off')
-    
-    # 创建统计表格
-    stats_data = []
-    for i, path_info in enumerate(all_paths):
-        stats_data.append([
-            f"路径{i+1}" + ('⭐' if path_info['is_best'] else ''),
-            f"{len(path_info['path'])}",
-            time_to_string(path_info['latest_departure']),
-            time_to_string(path_info['expected_departure']),
-            f"{path_info['std_departure']/10:.1f}",
-            f"{(target_arrival_time - path_info['latest_departure'])/10:.1f}"
-        ])
-    
-    table = ax4.table(
-        cellText=stats_data,
-        colLabels=['路径', '长度', '最晚出发', '期望出发', '标准差(分)', '预留(分)'],
-        cellLoc='center',
-        loc='center',
-        colWidths=[0.12, 0.10, 0.15, 0.15, 0.15, 0.15]
-    )
-    
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1, 2)
-    
-    # 设置表头样式
-    for i in range(6):
-        table[(0, i)].set_facecolor('#667eea')
-        table[(0, i)].set_text_props(weight='bold', color='white')
-    
-    # 高亮最优路径
-    if best_path_idx is not None:
-        for i in range(6):
-            table[(best_path_idx + 1, i)].set_facecolor('#ffcccc')
-    
-    ax4.set_title('候选路径统计汇总', fontsize=14, fontweight='bold', pad=20)
-    
-    # ═══════════════════════════════════════════════════════════════════
-    # 保存图表
-    # ═══════════════════════════════════════════════════════════════════
-    
-    plt.suptitle(f'α={alpha} 时所有候选路径的出发时间分布对比', 
-                fontsize=16, fontweight='bold', y=0.995)
-    plt.tight_layout(rect=[0, 0, 1, 0.99])
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"\n  ✓ 图表已保存: {output_file}\n")
-    plt.close()
+def format_minutes(time_01min):
+    """格式化分钟数（带单位）"""
+    minutes = time_01min / 10
+    return f"{minutes:.1f}分钟"
 
 
-def time_to_string(time_01min):
-    """时间格式转换"""
-    total_minutes = time_01min / 10
-    hours = int(total_minutes // 60)
-    minutes = int(total_minutes % 60)
-    return f"{hours:02d}:{minutes:02d}"
-
-
+def format_path(path):
+    """格式化路径输出"""
+    if len(path) <= 10:
+        return ' → '.join(map(str, path))
+    else:
+        return (f"{' → '.join(map(str, path[:5]))} → ..."
+                f"→ {' → '.join(map(str, path[-3:]))}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1192,36 +1498,30 @@ def run_all_tests_with_visualization(testname: str ):
 # ═══════════════════════════════════════════════════════════════════
 # 主程序
 # ═══════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    import sys
+    # 测试数据加载和预计算
+    print("\n测试数据加载和预计算...")
     
-    # 验证配置
-    print("验证配置...")
-    config.validate_config()
-    print()
+    load_data_once()
     
-    if len(sys.argv) > 1:
-        # 预先加载数据
-        load_data_once()
-        
-        # 运行指定测试
-        test_name = sys.argv[1]
-        if test_name == '1':
-            test_1_basic_solve()
-        elif test_name == '2':
-            test_2_alpha_sensitivity()
-        elif test_name == '3':
-            test_3_performance()
-        elif test_name == '4':
-            test_4_time_consistency()
-        elif test_name == '5':
-            test_5_multiple_od_pairs()
-        else:
-            print(f"未知测试: {test_name}")
-            print(f"可用测试: 1, 2, 3, 4, 5")
-    else:
-        for testname in config.TESTNAME:
-            # 运行所有测试并生成可视化
-            success = run_all_tests_with_visualization(testname)
-        sys.exit(0 if success else 1)
+    # 获取基础数据
+    G, sparse_data, node_to_index, scenario_dates, scenario_probs, time_intervals_per_day = get_data()
+    
+    # ✨ 获取预计算数据
+    adj_list_forward, adj_list_backward, link_distributions = get_precomputed_data()
+    
+    print("\n数据统计:")
+    print(f"  节点数: {len(G.nodes())}")
+    print(f"  边数: {len(G.edges())}")
+    print(f"  正向邻接表节点数: {len(adj_list_forward)}")
+    print(f"  反向邻接表节点数: {len(adj_list_backward)}")
+    print(f"  链路分布数: {len(link_distributions)}")
+    
+    # 测试邻接表
+    sample_node = list(adj_list_forward.keys())[0]
+    print(f"\n示例节点 {sample_node} 的邻接节点:")
+    print(f"  正向邻接:  {adj_list_forward.get(sample_node, [])[: 5]} ...")
+    if sample_node in adj_list_backward:
+        print(f"  反向邻接: {adj_list_backward[sample_node][:5]} ...")
+    
+    print("\n✓ 数据加载和预计算测试完成！")

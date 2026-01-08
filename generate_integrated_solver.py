@@ -458,12 +458,12 @@ window.loadNetworkData = async function() {
 // 运行求解器 - 立即定义
 // ==========================================
 window.runSolver = async function() {
-    if (!selectedOrigin || !selectedDestination) {
+    if (! selectedOrigin || !selectedDestination) {
         showStatus('请先选择起点和终点', 'error');
         return;
     }
     
-    if (!dataLoaded) {
+    if (! dataLoaded) {
         showStatus('请先加载路网数据', 'error');
         return;
     }
@@ -474,7 +474,7 @@ window.runSolver = async function() {
     const maxLabels = parseInt(document.getElementById('maxLabels').value);
     
     const params = {
-        mode:  mode,
+        mode: mode,
         origin: selectedOrigin,
         destination: selectedDestination,
         alpha: alpha,
@@ -492,21 +492,75 @@ window.runSolver = async function() {
     
     try {
         const response = await fetch(API_URL + '/api/solve', {
-            method: 'POST',
-            headers: { 'Content-Type':  'application/json' },
+            method:  'POST',
+            headers:  { 'Content-Type': 'application/json' },
             body: JSON.stringify(params)
         });
         
-        const result = await response.json();
+        console.log('[DEBUG] HTTP状态:', response.status);
+        console.log('[DEBUG] Content-Type:', response.headers.get('content-type'));
         
-        if (result.success) {
-            displayResult(result.result);
+        // 检查HTTP状态
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('[ERROR] HTTP错误:', response.status, errorText);
+            showStatus('服务器错误:  ' + response.status, 'error');
+            return;
+        }
+        
+        // 获取响应文本
+        const responseText = await response.text();
+        console.log('[DEBUG] 响应文本长度:', responseText.length);
+        console.log('[DEBUG] 响应文本（前500字符）:', responseText.substring(0, 500));
+        
+        // 解析JSON
+        let result;
+        try {
+            result = JSON.parse(responseText);
+        } catch (parseError) {
+            console.error('[ERROR] JSON解析失败:', parseError);
+            console.error('[ERROR] 响应文本:', responseText);
+            showStatus('数据解析失败', 'error');
+            return;
+        }
+        
+        // 详细调试
+        console.log('[DEBUG] ========== 解析后的数据 ==========');
+        console.log('[DEBUG] result对象:', result);
+        console.log('[DEBUG] result的类型:', typeof result);
+        console.log('[DEBUG] result的所有键:', Object.keys(result));
+        console.log('[DEBUG] result.success:', result.success);
+        console.log('[DEBUG] result.success类型:', typeof result.success);
+        console.log('[DEBUG] result.path:', result.path);
+        console.log('[DEBUG] result.path类型:', typeof result.path);
+        console.log('[DEBUG] result.path是数组吗:', Array.isArray(result.path));
+        
+        // ✅ 关键：宽松的成功判断
+        const isSuccess = Boolean(result && result.success);
+        const hasPath = Boolean(result && result.path && Array.isArray(result.path));
+        
+        console.log('[DEBUG] isSuccess:', isSuccess);
+        console.log('[DEBUG] hasPath:', hasPath);
+        
+        if (isSuccess && hasPath) {
+            console.log('[DEBUG] ✓✓✓ 条件满足，调用displayResult');
+            console.log('[DEBUG] 传递给displayResult的参数:', result);
+            displayResult(result);
             showStatus('✓ 求解成功！', 'success');
         } else {
-            showStatus('求解失败: ' + result.message, 'error');
+            console.log('[DEBUG] ✗✗✗ 条件不满足');
+            console.log('[DEBUG] - isSuccess:', isSuccess);
+            console.log('[DEBUG] - hasPath:', hasPath);
+            console.log('[DEBUG] - result:', result);
+            
+            const errorMsg = (result && result.message) ? result.message : '未知错误';
+            showStatus('求解失败: ' + errorMsg, 'error');
         }
     } catch (error) {
-        console.error('求解出错:', error);
+        console.error('[ERROR] ========== 捕获到异常 ==========');
+        console.error('[ERROR] 异常类型:', error.name);
+        console.error('[ERROR] 异常消息:', error.message);
+        console.error('[ERROR] 异常堆栈:', error.stack);
         showStatus('求解出错:  ' + error.message, 'error');
     } finally {
         hideLoading();
@@ -736,37 +790,102 @@ window.formatTime = formatTime;
 // 结果显示相关函数
 // ==========================================
 function displayResult(result) {
+    console.log('[displayResult] ========== 开始显示结果 ==========');
+    console.log('[displayResult] 接收到的参数:', result);
+    console.log('[displayResult] 参数类型:', typeof result);
+    
+    // 🔍 严格验证
+    if (! result) {
+        console.error('[displayResult] ❌ result 是 null 或 undefined');
+        showStatus('显示结果失败：数据为空', 'error');
+        return;
+    }
+    
+    if (typeof result !== 'object') {
+        console.error('[displayResult] ❌ result 不是对象');
+        showStatus('显示结果失败：数据类型错误', 'error');
+        return;
+    }
+    
+    console.log('[displayResult] result的所有键:', Object.keys(result));
+    
+    // 验证path字段
+    if (!result.path) {
+        console.error('[displayResult] ❌ result.path 不存在');
+        console.error('[displayResult] 可用字段:', Object.keys(result));
+        showStatus('显示结果失败：缺少路径数据', 'error');
+        return;
+    }
+    
+    if (! Array.isArray(result.path)) {
+        console.error('[displayResult] ❌ result.path 不是数组');
+        console.error('[displayResult] path类型:', typeof result.path);
+        console.error('[displayResult] path值:', result.path);
+        showStatus('显示结果失败：路径格式错误', 'error');
+        return;
+    }
+    
+    console.log('[displayResult] ✓ 数据验证通过');
+    console.log('[displayResult] path长度:', result.path.length);
+    console.log('[displayResult] path内容:', result.path);
+    
     const resultContent = document.getElementById('resultContent');
     
-    let html = '<div style="padding: 10px;">';
-    html += '<p><strong>路径长度:</strong> ' + result.path.length + ' 个节点</p>';
-    html += '<p><strong>求解时间:</strong> ' + result.total_time.toFixed(2) + ' 秒</p>';
-    
-    if (result.earliest_arrival_time) {
-        html += '<p><strong>最早到达: </strong> ' + (result.earliest_arrival_time / 10).toFixed(1) + ' 分</p>';
-    }
-    if (result.expected_arrival_time) {
-        html += '<p><strong>期望到达:</strong> ' + (result.expected_arrival_time / 10).toFixed(1) + ' 分</p>';
-    }
-    if (result.latest_departure_time) {
-        html += '<p><strong>最晚出发:</strong> ' + (result.latest_departure_time / 10).toFixed(1) + ' 分</p>';
-    }
-    if (result.expected_departure_time) {
-        html += '<p><strong>期望出发:</strong> ' + (result.expected_departure_time / 10).toFixed(1) + ' 分</p>';
+    // 辅助函数
+    function minutesToTimeString(decisMinutes) {
+        if (typeof decisMinutes !== 'number' || isNaN(decisMinutes)) {
+            return '00:00';
+        }
+        const totalMinutes = Math.round(decisMinutes / 10);
+        const hours = Math.floor(totalMinutes / 60);
+        const mins = totalMinutes % 60;
+        return String(hours).padStart(2, '0') + ':' + String(mins).padStart(2, '0');
     }
     
-    html += '<p><strong>候选路径数:</strong> ' + (result.num_candidates || 1) + '</p>';
-    html += '<hr style="margin: 10px 0;">';
-    html += '<button onclick="visualizePath(window.currentResult)" style="margin-top: 10px; padding: 8px 15px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; width: 100%;">📍 显示路径</button>';
-    html += '</div>';
-    
-    resultContent.innerHTML = html;
-    document.getElementById('resultPanel').classList.add('show');
-    
-    window.currentResult = result;
-    visualizePath(result);
+    try {
+        let html = '<div style="padding:  10px;">';
+        
+        // ✅ 安全访问
+        const pathLength = result.path ?  result.path.length : 0;
+        html += '<p><strong>路径长度: </strong> ' + pathLength + ' 个节点</p>';
+        html += '<p><strong>求解时间:</strong> ' + (result.total_time || 0).toFixed(2) + ' 秒</p>';
+        
+        // 正向求解字段
+        if (result.earliest_arrival_time != null) {
+            html += '<p><strong>最早到达: </strong> ' + minutesToTimeString(result.earliest_arrival_time) + '</p>';
+        }
+        if (result.expected_arrival_time != null) {
+            html += '<p><strong>期望到达:</strong> ' + minutesToTimeString(result.expected_arrival_time) + '</p>';
+        }
+        
+        // 反向求解字段
+        if (result.latest_departure_time != null) {
+            html += '<p><strong>最晚出发:</strong> ' + minutesToTimeString(result.latest_departure_time) + '</p>';
+        }
+        if (result.expected_departure_time != null) {
+            html += '<p><strong>期望出发:</strong> ' + minutesToTimeString(result.expected_departure_time) + '</p>';
+        }
+        
+        html += '<p><strong>候选路径数:</strong> ' + (result.num_candidates || 1) + '</p>';
+        html += '<hr style="margin: 10px 0;">';
+        html += '<button onclick="visualizePath(window.currentResult)" style="margin-top: 10px; padding: 8px 15px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; width: 100%;">📍 显示路径</button>';
+        html += '</div>';
+        
+        resultContent.innerHTML = html;
+        document.getElementById('resultPanel').classList.add('show');
+        
+        window.currentResult = result;
+        visualizePath(result);
+        
+        console.log('[displayResult] ✓✓✓ 渲染完成');
+    } catch (renderError) {
+        console.error('[displayResult] ❌ 渲染过程出错:', renderError);
+        console.error('[displayResult] 错误堆栈:', renderError.stack);
+        showStatus('显示结果时出错', 'error');
+    }
 }
 window.displayResult = displayResult;
+
 
 function visualizePath(result) {
     if (!result || !result.path) return;
@@ -1090,7 +1209,7 @@ function renderBasicTestSummary(testInfo) {
         // 关键指标
         html += '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom:  25px;">';
         html += renderSummaryCard('🛣️ 路径长度', (result.path_length || 0) + ' 节点', '#2196F3');
-        html += renderSummaryCard('⏱️ 求解时间', (result.total_time || 0).toFixed(2) + ' 秒', '#9C27B0');
+        // html += renderSummaryCard('⏱️ 求解时间', (result.total_time || 0).toFixed(2) + ' 秒', '#9C27B0');
         html += renderSummaryCard('🔄 迭代次数', (result.iterations || 0).toLocaleString(), '#FF9800');
         html += renderSummaryCard('📊 可靠性', ((result.alpha || 0) * 100).toFixed(0) + '%', '#667eea');
         html += '</div>';

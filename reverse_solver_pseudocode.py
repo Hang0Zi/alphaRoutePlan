@@ -108,7 +108,7 @@ class AlphaDiscreteDistribution:
         
         for slot in available_slots: 
             D_slot = get_link_dist_func(predecessor, current, slot)
-            if D_slot and D_slot. times:
+            if D_slot and D_slot.times:
                 min_travel = min(min_travel, min(D_slot.times))
                 max_travel = max(max_travel, max(D_slot.times))
         
@@ -222,7 +222,7 @@ class AlphaDiscreteDistribution:
         
         if total_prob <= 1e-10:
             if verbose:
-                print(f"    警告: 总概率过小:  {total_prob:. 10e}")
+                print(f"    警告: 总概率过小:  {total_prob:.10e}")
             
             # 使用未归一化的分布
             times = np.array(sorted(departure_probs.keys()))
@@ -269,7 +269,7 @@ class AlphaDiscreteDistribution:
         elif len(times) < self.L1:
             # 需要上采样
             cdf = np.cumsum(probs)
-            target_quantiles = np. linspace(1/(self.L1 + 1), self.L1/(self.L1 + 1), self.L1)
+            target_quantiles = np.linspace(1/(self.L1 + 1), self.L1/(self.L1 + 1), self.L1)
             sampled_times = np.interp(target_quantiles, cdf, times)
             sampled_weights = np.ones(self.L1) / self.L1
             
@@ -697,9 +697,12 @@ class ReverseLabelSettingSolver:
     
     def __init__(self, G, sparse_data, node_to_index, scenario_dates,
                  scenario_probs, time_intervals_per_day,
-                 L1: int = 50, L2: int = 10,
+                 L1: int = 50, L2: int = 10,K = 10,
                  verbose: bool = False,
-                 max_labels_per_node: int = 20):
+                 max_labels_per_node: int = 20,
+             adj_list=None,  # ✨ 新增
+             reverse_adj_list=None,
+             link_distributions=None):  # ✨ 新增
         """初始化"""
         self.G = G
         self.sparse_data = sparse_data
@@ -726,12 +729,26 @@ class ReverseLabelSettingSolver:
         
         # 构建邻接表
         self.adj_list = defaultdict(list)
-        self.reverse_adj_list = defaultdict(list)
-        self._build_adjacency_lists()
-        
+        self.reverse_adj_list = defaultdict(list) 
         # 预计算链路分布
         self.link_distributions = {}
-        self._precompute_link_distributions()
+
+        # 如果传入了预计算数据，直接使用
+        if adj_list is not None and reverse_adj_list is not None:
+            self.adj_list = adj_list
+            self.reverse_adj_list=reverse_adj_list
+            print("  ✓ 使用预计算邻接表")
+        else:
+            # 否则自己构建
+            self._build_adjacency_lists()
+        
+        if link_distributions is not None: 
+            self.link_distributions = link_distributions
+            print("  ✓ 使用预计算链路分布")
+        else:
+            # 否则自己计算
+            self._precompute_link_distributions()
+
         
         # 统计信息
         self.stats = defaultdict(int)
@@ -1105,7 +1122,7 @@ class ReverseLabelSettingSolver:
         return result
 
     def solve(self, origin: int, destination: int, target_arrival_time: int,
-            alpha: float, max_labels: int = 100000,
+            alpha: float, max_labels: int = 100000, K:int=5,
             print_interval: int = 100,
             save_all_paths: bool = True) -> Dict: 
         """
@@ -1115,7 +1132,7 @@ class ReverseLabelSettingSolver:
         """
         result = self.solve_k_paths(
             origin, destination, target_arrival_time, alpha,
-            K=5, max_labels=max_labels, print_interval=print_interval
+            K=K, max_labels=max_labels, print_interval=print_interval
         )
         
         # 添加all_paths用于兼容
